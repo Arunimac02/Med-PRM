@@ -42,7 +42,7 @@ MAX_TOKEN_LEN=4096
 INCLUDE_OPTIONS="no"
 
 # Create log directory
-LOG_DIR="logs"
+LOG_DIR="logs/inference"
 mkdir -p "$LOG_DIR"
 mkdir -p "$OUTPUT_DIR"
 
