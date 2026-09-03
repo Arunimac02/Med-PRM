@@ -6,20 +6,26 @@ from huggingface_hub import snapshot_download
 
 def download_and_inspect(repo_id: str, repo_type: str, base_dir: str):
     # repo_id 마지막 부분을 폴더명으로 사용
+    # uses the end part of the repo id as the name and then joins with the
+    # base dir to create a local dir if it doesn't exist
     name = repo_id.split("/")[-1]
     local_dir = os.path.join(base_dir, name)
     os.makedirs(local_dir, exist_ok=True)
 
+    # downloads the model
     print(f"\n▶ Downloading {repo_id!r} into {local_dir!r} …")
     snapshot_download(
         repo_id=repo_id,
         repo_type=repo_type,
         local_dir=local_dir
     )
+
+    # prints the files for the model in alphabetical order
     files = sorted(os.listdir(local_dir))
     print("  • Files in", name, ":", files)
 
     # JSON 검사 (dataset일 경우)
+    # does a json validation check for the datasets. Checks file ending with .json
     for fname in files:
         if not fname.endswith(".json") or fname.endswith(".index.json"):
             continue
@@ -33,6 +39,7 @@ def download_and_inspect(repo_id: str, repo_type: str, base_dir: str):
                 break
 
         # 데이터가 list인지 dict인지 구분
+        # checks if the data is a list or a dict
         if isinstance(data, list):
             print(f"    – Loaded JSONL/list of length {len(data)}")
             obj = data[0]
@@ -44,6 +51,7 @@ def download_and_inspect(repo_id: str, repo_type: str, base_dir: str):
             break
 
         # 공통으로 첫 레코드(혹은 객체)의 키 보여주기
+        # Display the keys of the first record (or object) for all of them
         print("    – Keys of first record/object:", list(obj.keys()))
         break
 
