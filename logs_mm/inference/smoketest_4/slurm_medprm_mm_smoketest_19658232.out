@@ -1,0 +1,4 @@
+=== Smoke test: Qwen/Qwen3-VL-8B-Instruct ===
+=== Done: Qwen/Qwen3-VL-8B-Instruct -> logs_mm/inference/smoketest_Qwen3-VL-8B-Instruct.log ===
+=== Smoke test: FreedomIntelligence/HuatuoGPT-Vision-7B-Qwen2.5VL ===
+=== Done: FreedomIntelligence/HuatuoGPT-Vision-7B-Qwen2.5VL -> logs_mm/inference/smoketest_HuatuoGPT-Vision-7B-Qwen2.5VL.log ===
