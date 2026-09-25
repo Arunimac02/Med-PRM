@@ -25,7 +25,6 @@ MULTIPLE_CHOICE_SOURCES = {"med_qa", "medmc_qa", "ddxplus", "mmlu_anatomy",
                           "mmlu_clinical_knowledge", "mmlu_college_biology", 
                           "mmlu_college_medicine", "mmlu_medical_genetics", 
                           "mmlu_professional_medicine", "pubmed_qa"}            
-OPEN_SOURCES           = {"nejm", "osce"}                   # 주관식
 
 SYSTEM_PROMPT = (
     "Solve the following question step-by-step. "
