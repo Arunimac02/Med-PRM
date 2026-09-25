@@ -1,0 +1,305 @@
+LoRA Training + Scoring — What Was Done and What Changed
+==========================================================
+
+Summary
+-------
+The original pipeline (python/2_training.py + scripts/2_training.sh) does
+full fine-tuning of the 8B Llama-3.1 model. That doesn't fit in memory on a
+single 40GB A100 without DeepSpeed/ZeRO. To get a working single-GPU
+training + scoring pipeline, I added a LoRA (parameter-efficient
+fine-tuning) path as new files alongside the originals, and updated the
+scoring script to run in parallel across multiple GPUs. The original files
+(python/2_training.py, scripts/2_training.sh) were left untouched so the
+full fine-tuning path still exists.
+
+Files added:
+  - python/2_training_lora.py       (based on python/2_training.py)
+  - scripts/2_training_lora.sh      (based on scripts/2_training.sh)
+  - scripts/4_scoring_lora_PRM.sh   (based on scripts/4_scoring_PRM.sh)
+
+File modified:
+  - python/4_scoring_PRM.py         (small robustness fix, still used by
+                                      both scoring scripts as-is)
+
+
+1) Training: python/2_training_lora.py (new, based on 2_training.py)
+----------------------------------------------------------------------
+- Added LoRA support via the `peft` library.
+    * New CLI flags: --use_lora (yes/no), --lora_r, --lora_alpha,
+      --lora_dropout, --lora_target_modules.
+    * When --use_lora=yes, the base model is frozen in bf16 and a LoRA
+      adapter is attached to the attention/MLP projection layers
+      (q/k/v/o_proj, gate/up/down_proj). The embedding table is also kept
+      trainable (via `modules_to_save=["embed_tokens"]`) since the script
+      adds a new special token (" ки") that needs to be learned.
+    * This is what makes the 8B fine-tune fit on a single 40GB A100 —
+      only the small adapter + embedding table are trained/optimized,
+      not the full 8B parameters.
+    * After training, the adapter is merged back into the base model
+      weights (`merge_and_unload()`) before saving, so the saved
+      checkpoint is a plain, ordinary model directory — no changes were
+      needed on the scoring side to load it (4_scoring_PRM.py still just
+      calls `AutoModelForCausalLM.from_pretrained(...)`).
+
+- Added checkpoint resume support.
+    * New flags: --resume_from_checkpoint (path to a checkpoint dir).
+    * `trainer.train(resume_from_checkpoint=...)` restores
+      optimizer/scheduler/step state, not just weights, so a run that
+      gets killed (e.g. by a SLURM time limit) can continue instead of
+      restarting from scratch.
+    * Also switched checkpoint saving from `save_strategy="epoch"` to
+      `save_strategy="steps"` with a configurable `--save_steps`, so
+      checkpoints are written frequently enough to actually resume from
+      (an epoch on this dataset can take a long time).
+
+- Fixed a torch.load compatibility issue for resuming.
+    * PyTorch >=2.6 changed the default of `torch.load` to
+      `weights_only=True`, which rejects the numpy RNG state pickled
+      inside Trainer's `rng_state.pth` checkpoint file. Patched
+      `torch.load` at the top of the script to default to
+      `weights_only=False` (safe here since all checkpoints loaded are
+      self-produced or official meta-llama weights).
+
+- Fixed a latent bug in the --online flag.
+    * The original used `type=bool` for --online, which is a classic
+      argparse footgun: `bool("False")` evaluates to `True` in Python,
+      because any non-empty string is truthy. That means passing
+      `--online False` on the command line was silently turning online
+      mode ON. Changed the flag to `type=str` and compare against the
+      string "True" instead.
+
+- Added --risk_param as an explicit logged CLI argument (previously used
+  in a log message but not exposed as its own flag).
+
+
+2) Training script: scripts/2_training_lora.sh (new, based on 2_training.sh)
+------------------------------------------------------------------------------
+- Points at the new python/2_training_lora.py script and passes through the
+  new LoRA flags (use_lora, lora_r, lora_alpha, lora_dropout) and the
+  resume_from_checkpoint path.
+- HF_TOKEN / WANDB_TOKEN are now only required when actually running in
+  online mode (W&B logging + HF Hub push). Offline runs no longer fail at
+  startup for missing tokens they don't need.
+- Added `set -o pipefail` so the script's exit status reflects a failure in
+  the training command itself, not just the trailing `tee` in the pipe.
+- Added a check that --resume_from_checkpoint (if set) actually exists
+  before launching training.
+- Added HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 env vars, since the
+  compute nodes used for training have no internet access — this forces
+  use of the local HF cache instead of trying (and failing) to reach the
+  Hub.
+- Lowered save_steps from 50000 to 200 to match the switch to
+  step-based checkpointing above.
+- Logs now go to logs/train/ instead of logs/.
+
+
+3) Scoring: python/4_scoring_PRM.py (modified in place)
+-----------------------------------------------------------
+- Wrapped `login(args.hf_token)` in a try/except. On offline compute
+  nodes this call has no network access and used to crash the whole
+  script; now it just prints a warning and continues (the script doesn't
+  actually need the Hub login for local model loading).
+- Added English translations alongside the original Korean comments
+  throughout the file (no logic changes) for readability going forward.
+- No changes to the actual scoring logic (get_prob / process_json_with_prm
+  are unchanged) — both the original and new scoring shell scripts call
+  this same file.
+
+
+4) Scoring script: scripts/4_scoring_lora_PRM.sh (new, based on 4_scoring_PRM.sh)
+-------------------------------------------------------------------------------------
+- The original script scored one model per GPU (one full input file per
+  GPU, from a MODEL_PATHS array). The new script instead scores a single
+  model faster by sharding the input dataset across multiple GPUs:
+    1. Splits the input JSON (list of questions) into N contiguous
+       chunks, N = number of GPUs listed in GPUS=(...).
+    2. Runs python/4_scoring_PRM.py once per GPU/shard in parallel,
+       each with its own shard as --input_json_file and its own shard
+       output file — same script, same model, same arguments each time,
+       just a disjoint subset of questions.
+    3. After all shards finish, merges the shard outputs back into one
+       final JSON file in the original question order, matching the
+       naming convention of the original single-run output file.
+  This is purely a runtime speedup (parallelizing across GPUs) — it does
+  not change how any individual question is scored.
+
+
+5) Base weights + hyperparameters used for the LoRA run
+-----------------------------------------------------------
+Values below are what's currently set in scripts/2_training_lora.sh.
+
+Base model weights
+  meta-llama/Llama-3.1-8B-Instruct
+    Why: same base checkpoint the original full fine-tuning script
+    (2_training.sh) uses, so the LoRA run is a direct, comparable
+    replacement rather than a different starting point. LoRA adapts this
+    frozen base rather than replacing it.
+
+LoRA adapter hyperparameters (peft.LoraConfig, in 2_training_lora.py)
+  lora_r            = 16
+    Why: rank of the low-rank update matrices. 16 is a common middle-ground
+    default for 7-8B instruction models — enough capacity to noticeably
+    shift behavior without the adapter itself becoming large or
+    memory-heavy. (Lower, e.g. 8, risks underfitting the reward/PRM task;
+    much higher, e.g. 64+, gives diminishing returns while eroding the
+    memory savings LoRA is there for.)
+  lora_alpha        = 32
+    Why: scaling factor for the adapter output, applied as alpha/r. Set to
+    2x the rank (32 = 2x16), which is the standard convention in the LoRA
+    literature/community — it keeps the effective learning-rate-like scale
+    of the adapter update in a well-behaved range relative to r, without
+    having to retune it independently every time r changes.
+  lora_dropout      = 0.05
+    Why: light regularization on the adapter path only (base weights are
+    frozen and already regularized by having been pretrained). 0.05 is the
+    standard default in most LoRA fine-tuning setups — enough to reduce
+    overfitting on a comparatively small task-specific dataset without
+    slowing convergence much.
+  lora_target_modules = q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    Why: attaches adapters to all attention projections (q/k/v/o) AND all
+    MLP projections (gate/up/down), i.e. every linear layer in each
+    transformer block. This is broader than the common "attention-only"
+    LoRA setup; the wider coverage was needed because the task here isn't
+    generic instruction-following but a fairly specific step-level
+    reward/PRM scoring behavior (predicting " ки" / "+"/"-" tokens), which
+    benefits from the MLP blocks also being adaptable, not just attention.
+  modules_to_save = ["embed_tokens"]
+    Why: not a LoRA layer, but the embedding table is set fully trainable
+    because the script adds a new special token (" ки") that has no
+    pretrained embedding — LoRA's low-rank update can't reasonably learn a
+    brand-new embedding row from scratch, so that table is trained
+    directly instead.
+
+Training hyperparameters (unchanged from the original full fine-tuning
+script, i.e. these are not LoRA-specific choices, but they govern the
+LoRA run since it reuses the same training config)
+  learning_rate               = 2e-6
+    Why: kept from the original full-fine-tune config. Note this is quite
+    low for LoRA specifically (LoRA papers commonly use 1e-4-3e-4 since
+    only a small adapter is being trained); it was left as-is here to stay
+    consistent with the already-validated full fine-tuning run rather than
+    retuning, but it's a candidate to raise if LoRA training is converging
+    too slowly.
+  per_device_train_batch_size = 1
+  gradient_accumulation_steps = 64
+    Why: effective batch size of 64 (1 x 64) reached via gradient
+    accumulation rather than a large per-step batch, since batch size 1 is
+    what fits per step in 40GB alongside the 8B frozen base model +
+    optimizer state for the adapter.
+  num_train_epochs            = 3
+  lr_scheduler_type            = cosine
+  bf16 / dtype                = True / bfloat16
+    Why: halves memory vs. fp32 and is numerically safer than fp16 for
+    this model family; needed to fit an 8B model on a single 40GB GPU at
+    all, LoRA or not.
+  max_token_len                = 4096
+  train_ratio                  = 1.0 (use the full training set)
+  save_steps                   = 200
+    Why: changed from the original's save_strategy="epoch" (which could
+    mean a very long gap between checkpoints) to checkpointing every 200
+    steps, so a killed/pre-empted job (e.g. SLURM time limit) loses at
+    most ~200 steps of progress and can resume via
+    --resume_from_checkpoint.
+  risk_param (mu)               = 5.0
+    Why: unchanged from the original script's default risk parameter for
+    the reward-weighting term; not something this LoRA work altered.
+
+
+6) Training run history + output
+-------------------------------------
+Getting to a completed run took 5 SLURM attempts (logs/train/run_1 .. run_5):
+  run_1 (2026-07-29) - failed immediately: compute node had no internet
+    access, so downloading meta-llama/Llama-3.1-8B-Instruct from the HF
+    Hub failed. (Fixed later by adding HF_HUB_OFFLINE=1 /
+    TRANSFORMERS_OFFLINE=1 to the launch script, section 2 above.)
+  run_2 (2026-07-29) - failed during a checkpoint save: `accelerate`
+    tried to import DeepSpeed while unwrapping the model and DeepSpeed's
+    op builder crashed looking for CUDA_HOME, which isn't set on this
+    node.
+  run_3 (2026-07-29 -> 2026-07-31) - ran for ~46.5 hours and reached
+    step 1402/2850 (epoch 1.46, 49% through the planned 3 epochs) before
+    being killed by the SLURM time limit. A checkpoint had been saved at
+    step 950 (checkpoint-950) shortly before that, so this run wasn't a
+    total loss.
+  run_4 (2026-07-31) - attempted to resume from run_3's checkpoint-950,
+    but crashed on the very first step with
+    `_pickle.UnpicklingError: Weights only load failed` while loading
+    the checkpoint's rng_state.pth. This is exactly the PyTorch >=2.6
+    `torch.load(weights_only=True)` default-change issue described in
+    section 1 above.
+  run_5 (2026-07-31) - same resume, after adding the torch.load patch.
+    Completed all 3 epochs successfully. This is the run whose output
+    (model_train/meta-llama/Llama-3.1-8B-Instruct-gemini_label-filter_yes
+    -ep3-20260731_191535-RAG_yes) is the model used for scoring below.
+
+Final run (run_5) stats:
+  - Trainable parameters: 567,283,712 / 8,597,553,152 total (6.60%) —
+    i.e. the LoRA adapter + embed_tokens being trained is ~6.6% of the
+    full model size, consistent with the memory-savings goal in section 5.
+  - Training set: 11,700 examples (1 skipped due to a data error).
+  - Loss trajectory (average training loss per ~0.1 epoch, combining
+    run_3's fresh start and run_5's resume of the same run):
+      epoch 0.0        ~72.8   (initial, first ~40 steps)
+      epoch 0.1 - 0.9   44.1 -> 25.3   (fast initial drop)
+      epoch 1.0 - 1.9   24.4 -> 22.7   (slow, steady decline)
+      epoch 2.0 - 3.0   23.6 -> 23.0   (plateaus in the low-to-mid 20s)
+    Takeaway: most of the loss reduction happens in the first epoch; loss
+    plateaus afterward rather than continuing to drop much through
+    epochs 2-3. Worth flagging to discuss whether 3 epochs / this
+    learning rate is the right stopping point, or whether the plateau
+    reflects the very low learning_rate=2e-6 carried over from the full
+    fine-tune config (see the note on this in section 5).
+  - `trainer_state`/final Trainer summary for the run_5 portion only:
+    train_runtime=226,242s (~62.8 hours), train_samples_per_second=0.807,
+    train_steps_per_second=0.013, train_loss=15.51 (this is HF Trainer's
+    own running average and is pulled down by the much higher early-epoch
+    losses above, not a step-1400-to-2850-only average).
+  - LoRA adapter merged into the base weights and saved successfully
+    (see section 1); no errors during save/merge.
+
+
+7) Test / scoring output
+-----------------------------
+Ran via scripts/4_scoring_lora_PRM.sh on the model above, against
+dataset/dataset_3_sampled_dataset/.../2_test_dataset.json (5,469 test
+questions, up to 64 sampled solutions scored per question), sharded
+across 2 GPUs as described in section 4.
+
+  Shard 0 (2,735 questions): PRM Accuracy 1,907/2,735 (69.73%),
+                             Maj-Vote Accuracy 1,856/2,735 (67.86%)
+  Shard 1 (2,734 questions): PRM Accuracy 2,136/2,734 (78.13%),
+                             Maj-Vote Accuracy 2,098/2,734 (76.74%)
+  Combined (5,469 questions): PRM Accuracy 4,043/5,469 (73.94%),
+                              Maj-Vote Accuracy 3,954/5,469 (72.30%)
+
+  (PRM Accuracy = correctness of the single solution the PRM model scores
+  highest per question; Maj-Vote Accuracy = correctness of whichever
+  final answer occurs most often among the sampled solutions. PRM
+  outperforming majority voting by ~1.6pp is the expected/desired result
+  — it's what shows the trained reward model is adding value over plain
+  self-consistency.)
+
+  The two shard outputs were merged back into a single file
+  (dataset/dataset_4_scored_dataset/Llama-3.1-8B-Instruct-gemini_label-
+  filter_yes-ep3-20260731_191535-RAG_yes__sol64_2_test_dataset.json,
+  verified at 5,469 records — matches the input count exactly, confirming
+  no questions were dropped or duplicated by the sharding/merge step).
+
+  Note: there's a noticeable gap between shard 0 (69.7%) and shard 1
+  (78.1%) accuracy. Since sharding just splits the input file into two
+  contiguous halves (not a random split), this likely reflects the test
+  set not being uniformly shuffled/distributed by difficulty or source
+  across its length, rather than any difference in how the two shards
+  were processed (same model, same code, same args). Worth checking if
+  this matters for reporting an overall number.
+
+
+Net effect
+----------
+- Full fine-tuning path (2_training.py / 2_training.sh) is unchanged and
+  still available.
+- New LoRA path (2_training_lora.py / 2_training_lora.sh) makes 8B
+  fine-tuning feasible on a single 40GB A100, with checkpoint resume.
+- Scoring script now supports both a single model on multiple GPUs
+  (sharded, new) and multiple models across GPUs (original), and is more
+  robust to running on offline compute nodes.

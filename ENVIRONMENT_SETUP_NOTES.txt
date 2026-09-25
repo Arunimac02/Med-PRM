@@ -1,0 +1,113 @@
+PRM Conda Environment — Setup / Troubleshooting Notes
+=======================================================
+
+Context
+-------
+environment.yml is a working copy derived from environment_no_flashattn.yml
+(the original, authored by jaehoon), adjusted for this system:
+  - prefix changed from /home/jaehoon/.conda/envs/PRM to
+    /scratch/user/arunimac02/.conda/envs/PRM (conda envs live under
+    /scratch/user/arunimac02/.conda/envs/ on this system, not
+    /home/arunimac02/.conda/envs/, due to a scratch-redirect .condarc config)
+  - flash-attn intentionally left out of the main environment.yml
+
+Problem
+-------
+Running `conda env create -f environment.yml` failed during the pip stage
+with pip's dependency resolver reporting an unresolvable conflict:
+
+  vllm==0.8.4        requires transformers>=4.51.1
+  trl==0.12.2         requires transformers<4.47.0
+  environment.yml     pins    transformers==4.46.3
+
+All three are hard version pins, so no single transformers version can
+satisfy both trl and vllm at once. This conflict was not introduced by any
+edit — the same three pins already existed in the original
+environment_no_flashattn.yml, so a fresh `conda env create` from that file
+would hit the identical error today.
+
+Root cause
+----------
+environment.yml (and environment_no_flashattn.yml) is essentially a frozen
+snapshot of a previously-working install (looks like the output of
+`conda env export`), not a spec meant to be resolved fresh. The original
+environment was almost certainly built by installing packages individually
+or with --no-deps (skipping full dependency resolution), so the exact pinned
+versions coexisted in practice even though pip's resolver — which always
+checks all declared dependencies strictly — would reject them if asked to
+solve them all together from scratch.
+
+Fix
+---
+Reproduce the environment as a snapshot restore instead of a fresh resolve:
+
+1. Split environment.yml into two parts:
+     a. Conda-level dependencies only (python, conda-forge packages) —
+        no pip section.
+     b. The full pinned pip package list (200 packages, one per line,
+        e.g. `transformers==4.46.3`).
+
+2. Create the base env from the conda-only file:
+     conda env create -f environment_conda_only.yml
+
+3. Activate it and install every pinned pip package in one shot with
+   --no-deps, which skips dependency resolution entirely and just installs
+   exactly what's listed:
+     conda activate PRM
+     pip install --no-deps -r pip_requirements_pinned.txt
+
+   Because --no-deps never asks "does X's declared dependency range allow
+   Y", the trl/vllm/transformers conflict never gets evaluated — the exact
+   versions from the working snapshot are installed directly, matching how
+   the original environment was almost certainly built.
+
+4. Verified working after install:
+     python -c "import torch, transformers, trl, vllm; ..."
+   torch 2.6.0+cu124 (CUDA available), transformers 4.46.3, trl 0.12.2,
+   vllm 0.8.4 — all import cleanly.
+
+Secondary fixes applied to environment.yml along the way
+----------------------------------------------------------
+- Restored version pins that had drifted to unpinned in environment.yml
+  (grpcio, grpcio-status, the opentelemetry-* packages) and re-added a
+  missing protobuf==3.20.2 pin, to match environment_no_flashattn.yml
+  exactly (minus flash-attn and the prefix), since these looked like
+  unintentional drift rather than a deliberate change.
+
+flash-attn (installed separately, not in environment.yml)
+-----------------------------------------------------------
+flash-attn==2.7.4.post1 normally requires compiling from source (needs
+nvcc matching the CUDA toolkit + significant build time/RAM). To avoid
+that, installed the matching prebuilt wheel from the project's GitHub
+releases instead of PyPI:
+
+  pip install --no-deps \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
+
+Wheel selection criteria that must match your torch build:
+  - cp310            -> Python 3.10
+  - cu12             -> CUDA 12.x (torch built as +cu124)
+  - torch2.6         -> torch==2.6.0
+  - cxx11abiFALSE    -> matches `torch._C._GLIBCXX_USE_CXX11_ABI` (False here)
+
+flash-attn imports successfully, but note: this node's GPUs are Tesla T4
+(Turing, compute capability 7.5). FlashAttention 2 requires Ampere or newer
+(compute capability >= 8.0), so any actual forward/backward call fails with:
+  RuntimeError: FlashAttention only supports Ampere GPUs or newer.
+This is a hardware limitation, not an install problem. Code paths that
+hardcode attn_implementation="flash_attention_2" (python/2_training.py:101,
+python/4_scoring_PRM.py:127) will need to run on an Ampere+ GPU (e.g. an
+A100 via a SLURM job on Grace) rather than on this T4 node.
+
+File naming update (2026-09-25)
+--------------------------------
+- environment_no_flashattn.yml renamed to environment_original.yml. It is
+  the unedited original environment.yml from the upstream repo (byte-identical
+  to the pre-edit git history), kept as a reference copy — not a
+  flash-attn-free variant, so the old name was inaccurate.
+- pip_requirements_pinned.txt added: the full 200-package pinned pip list
+  (torch/torchvision/torchaudio included, flash-attn excluded), extracted
+  directly from environment.yml's pip section. This is the file referenced
+  by step 3 above (`pip install --no-deps -r pip_requirements_pinned.txt`)
+  — keep it in sync with environment.yml's pip section if that file is
+  edited again, so the env can be reproduced from scratch the same way.

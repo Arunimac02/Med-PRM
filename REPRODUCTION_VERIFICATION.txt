@@ -1,0 +1,134 @@
+LoRA Reproduction vs. Original Med-PRM Paper — Verification
+==============================================================
+
+Purpose
+-------
+Before starting the multimodal-PRM work, confirm the LoRA-based reproduction
+(see LORA_TRAINING_AND_SCORING_CHANGES.txt) actually reproduces the original
+paper's numbers under a matched evaluation protocol, rather than trusting the
+raw 73.94% "combined" figure reported after the initial scoring run.
+
+
+IMPORTANT correction to the initial scoring run
+------------------------------------------------
+The 73.94% PRM Accuracy / 72.30% Maj-Vote Accuracy reported after the LoRA
+scoring run (scripts/4_scoring_lora_PRM.sh) is NOT a MedQA-4 number. The test
+file (dataset_3_sampled_dataset/.../2_test_dataset.json, 5,469 questions) is
+a combined pool of 8 different benchmarks, identified by a `data_source`
+field:
+
+  med_qa_4op                  1,273   (standard MedQA, 4-option test size)
+  med_qa                      1,273   (MedQA, 5-option)
+  pubmed_qa                     500
+  medmc_qa                      500
+  ddxplus                       500
+  mmlu_professional_medicine    272
+  mmlu_clinical_knowledge       265
+  osce                           214
+  mmlu_college_medicine          173
+  mmlu_college_biology           144
+  mmlu_anatomy                   135
+  nejm                           120
+  mmlu_medical_genetics          100
+  -------------------------------------
+  total                        5,469
+
+73.94%/72.30% is a sample-count-weighted average across all 13 subsets, not
+a like-for-like comparison to any single number the paper reports. It also
+explains the earlier "shard 0 (69.7%) vs shard 1 (78.1%)" gap noted after
+sharded scoring: the file is grouped by data_source, not shuffled, so a
+contiguous 2-way split cuts unevenly across benchmarks of very different
+difficulty (e.g. mmlu_medical_genetics ~87% vs nejm ~56%) rather than
+reflecting anything about the scoring itself.
+
+A second protocol mismatch: the paper reports three different strategies
+per benchmark — Best-of-N, Self-Consistency (SC), and a SC+RM hybrid — and
+the 78.24% figure in the repo's README scoreboard is the SC+RM hybrid, not
+Best-of-N. This repo's scoring script (python/4_scoring_PRM.py) computes:
+  - "PRM Accuracy"     = pick the single solution with the highest
+                          PRM_min_score (min per-step reward)  -> matches
+                          the paper's "Best-of-N" definition exactly.
+  - "Maj-Vote Accuracy" = pick the most common final answer, correct if any
+                          solution with that answer is labeled correct
+                          -> matches the paper's "Self-Consistency" (SC).
+So the script's two native metrics should be compared to the paper's
+Best-of-N and SC columns, not to the SC+RM number in the README.
+
+
+Corrected comparison: MedQA-4 (data_source == med_qa_4op, N=1,273)
+--------------------------------------------------------------------
+This subset is the right one to isolate: it's exactly the standard MedQA-4
+test size (1,273), and both papers and this repro use N=64 sampled
+solutions per question. Recomputing accuracy restricted to this subset from
+the scored output (dataset_4_scored_dataset/...__sol64_2_test_dataset.json):
+
+  Strategy              This repro (LoRA)   Paper (Llama-3.1-8B-Instruct)   Diff
+  ---------------------------------------------------------------------------
+  Self-Consistency (SC)      75.18%                  74.86%                +0.32pp
+  Best-of-N (= PRM Acc)      76.98%                  76.98%                 0.00pp
+  SC+RM hybrid                77.69–77.93%           78.24%                -0.3 to -0.6pp
+
+Best-of-N matches the paper to two decimal places (980/1,273 both sides).
+SC and the SC+RM hybrid are within ~0.5pp. This is a strong, direct
+confirmation that the LoRA-trained reward model reproduces the paper's
+official (presumably fully fine-tuned) reward model on MedQA-4, despite
+training only ~6.6% of the parameters.
+
+(SC+RM hybrid was computed two ways since the paper's reward term RM(q,S_j)
+in "arg max_a sum 1[answer_j=a]*RM(q,S_j)" isn't unambiguous from the
+scoring script's two stored scores — using PRM_min_score gives 77.69%,
+using PRM_score (final-step score) gives 77.93%; both bracket the paper's
+78.24% closely.)
+
+
+Second benchmark: MedMCQA (data_source == medmc_qa, N=500)
+---------------------------------------------------------------
+Picked as the second representative test set per the "1-2 benchmarks"
+guidance — it's the other benchmark this repo's test file already has
+solutions sampled and scored for for (Table 6, Appendix J of the paper),
+so no new sampling/scoring run was needed.
+
+  Strategy              This repro (LoRA)   Paper (Llama-3.1-8B-Instruct)   Diff
+  ---------------------------------------------------------------------------
+  Self-Consistency (SC)      63.40%                  63.40%                 0.00pp
+  Best-of-N (= PRM Acc)      65.60%                  63.40%                +2.20pp
+  SC+RM hybrid                65.80%                  66.40%                -0.60pp
+
+SC matches exactly. Best-of-N and SC+RM are both within ~2pp, with Best-of-N
+actually outperforming the paper's number here (note: paper's MedMCQA table
+is Appendix J / Table 6, a secondary table, vs. the MedQA-4 numbers which
+are the paper's primary Table 1/2 headline result — treat the MedQA-4
+comparison above as the stronger signal of the two).
+
+
+Conclusion
+----------
+- The reproduction is validated: on the correctly-isolated MedQA-4 subset
+  with matched protocol (N=64, Best-of-N), the LoRA-trained reward model
+  matches the paper's reported number exactly (76.98% both sides), and is
+  within ~0.5pp on the other two strategies. MedMCQA gives a consistent
+  picture (exact match on SC, within ~2pp elsewhere).
+- The earlier ~4pp gap discussed (73.94% vs. README's 78.24%) was an
+  artifact of comparing a blended 13-subset average against a MedQA-4-only,
+  SC+RM-hybrid number — not a real reproduction shortfall. No further work
+  is needed to close that "gap"; it doesn't exist once benchmark and
+  strategy are matched correctly.
+- Practical implication for future scoring runs/reports: always slice by
+  `data_source` before reporting a headline accuracy number, and be
+  explicit about which of {SC, Best-of-N, SC+RM} is being reported, since
+  the repo's two native metrics (PRM Accuracy, Maj-Vote Accuracy) only
+  cover Best-of-N and SC, not the paper's headline SC+RM strategy.
+- With reproduction now verified on two benchmarks, the project can move to
+  the next priority: using the text-only MedPRM's blind spots on
+  image-grounded reasoning errors as motivation for a multimodal PRM.
+
+
+Source of paper numbers
+------------------------
+arXiv:2506.11474v2 (Med-PRM: Medical Reasoning Models with Step-wise
+Guideline-verified Process Rewards), HTML rendering at
+arxiv.org/html/2506.11474v2 — Table 1/2 (main MedQA-4 results) and Table 6,
+Appendix J (MedMCQA and other benchmarks). Pulled via web fetch, not
+manually re-verified against the PDF's rendered tables (PDF page rendering
+tool unavailable in this environment) — worth a spot-check against the PDF
+or camera-ready version if these numbers get used in a paper/report.
