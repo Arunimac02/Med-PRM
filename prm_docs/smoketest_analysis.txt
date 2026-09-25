@@ -1,0 +1,452 @@
+MULTIMODAL PRM - SMOKE TEST ANALYSIS (python_mm/3_generate_traces.py)
+========================================================================
+
+PURPOSE
+-------
+Before committing to the full-scale run (11,286 questions x 2 models),
+validated the entire multimodal trace-generation pipeline end-to-end on
+a small slice: 4 questions per data source (vqa_rad, slake,
+medxpertqa_mm -- 12 questions total) x 4 samples per question x both
+models (Qwen3-VL-8B-Instruct, HuatuoGPT-Vision-7B-Qwen2.5VL).
+
+Scripts: scripts_mm/3_generate_traces_smoketest.sh (shell wrapper),
+slurm_jobs/run_generate_traces_mm_smoketest.sh (SLURM submission, 1x
+A100, gpu partition).
+
+
+SMOKE TEST 1 -- ENVIRONMENT DEBUGGING + FIRST SUCCESSFUL RUN
+==============================================================
+
+Getting to a successful run took 4 SLURM submissions. The first 3
+failed on environment/API issues specific to PRM_mm's newer, unpinned
+vllm (0.28.0) vs. the text pipeline's pinned vllm==0.8.4 -- none of
+these ever showed up in the original text-only pipeline, since that
+pipeline never touched these codepaths.
+
+Job 19657307 -- FAILED (~4m38s)
+  Error: TypeError: EngineArgs.__init__() got an unexpected keyword
+  argument 'device'
+  Cause: `LLM(..., device="cuda")` -- vllm removed `device` as an
+  EngineArgs parameter entirely in 0.28.0 (confirmed via
+  inspect.signature(EngineArgs.__init__) in the actual PRM_mm env).
+  GPU selection doesn't depend on this kwarg anyway -- it's handled by
+  `os.environ["CUDA_VISIBLE_DEVICES"]` a few lines earlier in the script.
+  Fix: dropped the `device="cuda"` kwarg from the LLM(...) call in
+  python_mm/3_generate_traces.py.
+
+Job 19657337 -- FAILED (~51s, failed fast, before model even loaded)
+  Error: httpx.ConnectError: [Errno 101] Network is unreachable, while
+  vllm/huggingface_hub tried to reach the Hub to check for updated
+  config/repo file lists.
+  Cause: compute nodes on this cluster (gpu partition) have no internet
+  access -- only login nodes do. Both models were already fully
+  downloaded locally, so this call was unnecessary, just not suppressed.
+  Fix: added `export HF_HUB_OFFLINE=1` and `export
+  TRANSFORMERS_OFFLINE=1` to slurm_jobs/run_generate_traces_mm_smoketest.sh,
+  forcing use of the already-downloaded local HF cache.
+
+Job 19657608 -- FAILED (~4m23s, failed after model loaded + torch.compile
+  succeeded, at the very first sampling call)
+  Error: RuntimeError: Could not find nvcc and default
+  cuda_home='/usr/local/cuda' doesn't exist
+  Cause: vllm 0.28's V1 engine defaults to an optional FlashInfer-
+  accelerated top-k/top-p sampler (VLLM_USE_FLASHINFER_SAMPLER=True by
+  default, confirmed in vllm/envs.py). FlashInfer's sampling kernel
+  isn't a precompiled binary -- it JIT-compiles via nvcc on first use.
+  nvcc wasn't on PATH in the PRM_mm conda env or the compute node.
+  Checked `module spider CUDA` -- versions up to CUDA/13.1.0 available.
+  Checked PRM_mm's installed torch: `torch 2.13.0+cu130` (built for
+  CUDA 13.0).
+  Fix: added `module load CUDA/13.1.0` to the SLURM script (right after
+  the Anaconda module load), matching torch's CUDA 13.0 build, so nvcc
+  is available and FlashInfer's fast sampler still gets used (chose
+  this over disabling FlashInfer via VLLM_USE_FLASHINFER_SAMPLER=0,
+  which would have been the simpler but slower alternative).
+
+Job 19657724 -- COMPLETED (8m48s total, all 3 fixes applied)
+  Also reduced --mem from 64G (copied from the unrelated, heavier
+  run_scoring.sh template) to 16G before this run, since GPU VRAM (not
+  host RAM) is what holds the ~8B model; sacct later confirmed actual
+  peak host RAM usage was only ~4.2GB, well under even the reduced 16G.
+
+  Ran on node g086, 1x A100, gpu_memory_utilization=0.90, max_tokens=2048.
+
+  Logs archived under logs_mm/inference/smoketest_1/ (moved there, not
+  deleted, before smoke test 2 overwrote the default log locations):
+    - slurm_medprm_mm_smoketest_19657724.out / .err
+    - smoketest_Qwen3-VL-8B-Instruct.log
+    - smoketest_HuatuoGPT-Vision-7B-Qwen2.5VL.log
+
+
+TIMING + MEMORY (from job 19657724)
+-------------------------------------
+Total wall-clock: 8m48s for both models sequentially on 1 A100.
+
+                              Qwen3-VL-8B      HuatuoGPT-Vision-7B
+Process start -> model loaded   ~40s              ~33s
+torch.compile / warmup          ~56s              ~30s
+Generation (12 Q x ~5 samples    ~2m27s            ~33s
+  first pass, w/ images)
+Total (script start -> output   ~4m3s             ~1m58s
+  written)
+
+Plus a one-time ~1m52s shared setup cost at job start (SLURM dispatch,
+module loads, conda activate, first `import vllm` -- vllm imports are
+slow, also observed interactively on the login node while writing the
+script, taking 1-2+ minutes each time).
+
+Huatuo generated the same 12-question workload ~4.5x faster than Qwen.
+This tracks with GPU memory: Qwen's weights (16.79 GiB) left less room
+under the 90% gpu_memory_utilization budget for vllm's KV-cache batch
+(117,488 tokens, ~57x concurrency at 2048 tokens/request) than Huatuo's
+smaller weights (15.67 GiB) did (316,832 tokens, ~155x concurrency) --
+more concurrent sequences in-flight = faster wall-clock throughput.
+
+Host RAM: sacct MaxRSS for the whole job was only 4.2GB (vs. the 16G
+requested) -- confirms 16G is a generous, not tight, allocation at this
+scale. GPU VRAM: model weights alone were 15.67-16.79 GiB per model,
+comfortably within a single A100's capacity alongside the KV cache.
+
+
+ISSUES FOUND IN SMOKE TEST 1 OUTPUT
+--------------------------------------
+
+1) Qwen truncation on long medxpertqa_mm vignettes (qid=9282)
+   All 4 solutions for this question got cut off mid-word/mid-sentence
+   before ever reaching "the answer is (X)":
+     sol 0: "...gallstones, gallbl" (mid-word)
+     sol 1: "...invasive procedure that can diagnose and" (mid-sentence)
+     sol 3: "...(D) Abdominal ultrasound of the right upper quadrant -"
+            (cut off right as it reached the correct answer)
+   Cause: max_tokens=2048 was too small for this question's long
+   clinical vignette (1776 chars) plus 5-option step-by-step reasoning.
+   A shorter question (qid=9285, 1459 chars) completed fine in the same
+   budget. Confirmed via character counts -- all 4 solutions ended
+   right around 2189-2309 characters, consistent with hitting a token
+   cap, not the model choosing to stop.
+   Consequence: extract_mc_answer() found no "the answer is" phrase (it
+   was never generated) -> pred=None -> score forced to 0 by
+   `int(pred == gt) if pred else 0`. This is the same numeric result
+   ("wrong") that a confidently-incorrect answer would produce -- the
+   output JSON couldn't distinguish "model got it wrong" from "model
+   never got to answer." For PRM/ORM training, this would mislabel
+   genuinely-in-progress-correct reasoning as a negative example.
+
+2) Huatuo skipping the requested format entirely (qid=2252, SLAKE, CLOSED)
+   Solution 2's entire raw output was the single word "Yes" -- no
+   "## Step" reasoning, no "## Final Answer:" phrase, despite the
+   system prompt explicitly requesting that structure.
+   Consequence: extract_qa_answer()'s regex (looking for
+   "Final Answer:") found nothing -> pred="" -> score forced to 0,
+   even though "Yes" is the exact correct answer (ground truth: "Yes").
+
+3) The "ки" special token, mistaken for garbled text
+   Cyrillic "ки" (U+043A U+0438) is deliberately appended by
+   prm_process_solution/orm_process_solution as a step/solution-
+   boundary marker for later PRM/ORM training -- this exactly mirrors
+   python/2_training.py's convention (`additional_special_tokens:
+   [" ки"]`, later replaced with "+"/"-" per the correctness label).
+   For qid=2252 sol 2 above, this produced `orm_processed_solution =
+   "Yes ки"`. In some fonts/editors, Cyrillic "ки" can visually read
+   like Latin "kn" to someone not expecting non-Latin characters --
+   this was flagged as a possible bug during review but is expected,
+   by-design behavior inherited unchanged from the text pipeline.
+
+
+FIXES APPLIED BEFORE SMOKE TEST 2
+-------------------------------------
+1. MAX_TOKENS raised from 2048 -> 4096 in
+   scripts_mm/3_generate_traces_smoketest.sh, matching the text
+   pipeline's own default, to give long vignettes room to finish.
+
+2. extract_qa_answer() in python_mm/3_generate_traces.py given a
+   fallback: if the strict "Final Answer:" phrase isn't found, AND the
+   response has no step structure (a single block, i.e.
+   len(extract_steps_from_text(txt)) <= 1) AND is short (<=100 chars),
+   treat the entire trimmed response as the answer. This deliberately
+   does NOT fire on long, unstructured text with no "Final Answer:" --
+   that's more likely a truncated multi-step response than a terse
+   direct answer, and guessing at an answer there would be worse than
+   leaving it blank.
+
+
+SMOKE TEST 2 -- VALIDATING THE FIXES
+========================================
+
+Job 19657920 -- COMPLETED on the first attempt (12m28s; all env fixes
+from smoke test 1 carried over in the SLURM script, so no new
+environment failures this time). Same node pool, same resource request.
+Logs/outputs at the default locations (logs_mm/inference/,
+dataset_mm/smoketest_traces/) -- these overwrote smoke test 1's copies
+in those default locations, but smoke test 1's 4 log files were
+preserved under logs_mm/inference/smoketest_1/ beforehand.
+
+Confirmed fixes worked:
+
+- Qwen qid=9282 (previously truncated on all 4 solutions): now
+  completes normally on all 4, ending with "the answer is (D)",
+  answer='D', score=1 (matches ground truth 'D') for every solution.
+
+- Huatuo qid=2252 sol 0 (previously bare "Yes" with no extractable
+  answer): now correctly extracted via the new fallback ->
+  answer='Yes', score=1.
+
+- Swept both output files for any remaining empty/None answers on
+  non-OPEN questions:
+    Qwen:   none found.
+    Huatuo: 4 remaining (see new issue below) -- all on MC questions,
+            none on CLOSED/OPEN, confirming the QA-fallback fix fully
+            resolved the CLOSED/OPEN extraction gap for this slice.
+
+
+NEW ISSUE FOUND IN SMOKE TEST 2 -- MC extraction too strict for Huatuo
+--------------------------------------------------------------------------
+extract_mc_answer() only recognizes the literal phrase "answer is" /
+"the answer is" / "final answer is" immediately preceding the chosen
+letter (plus a \boxed{} pattern). Qwen reliably uses this exact idiom
+(matches the prompt instruction literally). HuatuoGPT-Vision does not,
+even though the prompt explicitly asks for it. Four MC solutions came
+back with answer=None, score=0 despite the model clearly stating a
+letter choice in each:
+
+  qid=9282 sol=1: "...is an abdominal ultrasound of the right upper
+    quadrant (D)." -- letter appended after the full option text
+    restated in prose, no "answer is" phrase directly before it.
+
+  qid=9283 sol=0: "## Final Answer: The most appropriate next step in
+    management is (E) Echocardiogram." -- has the "Final Answer:"
+    heading, but a full descriptive sentence intervenes before "(E)"
+    rather than the letter following immediately.
+
+  qid=9283 sol=1: no letter/answer statement found near the end at all
+    -- possibly a genuine unresolved case rather than a phrasing
+    mismatch; not yet individually confirmed.
+
+  qid=9285 sol=0: "### Answer: (D) Biopsy of mass" -- different heading
+    style (### instead of ##) and "Answer:" without "is".
+
+In at least 3 of these 4 cases, a human reader can immediately tell
+which letter the model chose; the regex just isn't flexible enough to
+find it. Same underlying pattern as issues (1) and (2) above: the
+models don't rigidly follow the exact requested output phrasing, and
+the current extraction logic is brittle to that.
+
+STATUS: FIXED, confirmed in smoke test 3 (see below). Fix implemented:
+gave extract_mc_answer() a fallback mirroring extract_qa_answer()'s
+approach -- if the strict "answer is" phrase search fails, fall back to
+taking the last standalone parenthesized single letter (e.g. "(D)")
+found anywhere in the text, on the reasoning that models consistently
+state their actual final choice last, after narrating
+through/eliminating other options earlier in the text.
+
+
+SMOKE TEST 3 -- VALIDATING THE MC EXTRACTION FALLBACK
+==========================================================
+
+Job 19658148 -- COMPLETED (12m06s), same node pool/resources, no new
+environment failures (all prior fixes still in place). Logs/outputs
+archived under logs_mm/inference/smoketest_3/ and
+dataset_mm/smoketest_traces/smoketest_3/ before smoke test 4 overwrote
+the default locations.
+
+Re-checked the exact 4 previously-failing cases from smoke test 2:
+
+  qid=9282 sol=1: answer='D', score=1 (correct -- matches ground truth 'D')
+  qid=9285 sol=0: answer='D', score=1 (correct -- matches ground truth 'D')
+  qid=9283 sol=0: answer='E', score=0 (ground truth is 'B' -- genuinely
+    scored wrong now, not an extraction failure)
+  qid=9283 sol=1: answer='E', score=0 (same as above)
+
+Swept the whole Huatuo output file for any remaining empty/None answers
+on non-OPEN questions: zero found. The qid=9283 result is a reassuring
+sign, not a concern -- it confirms the fallback isn't just rubber-
+stamping every extraction as correct; it recovers the model's actual
+stated letter whether that letter happens to be right or wrong.
+
+
+WHAT'S WORKING CORRECTLY (confirmed across both smoke tests)
+==================================================================
+
+- Image attachment via vllm's "image_pil" content-part shorthand is
+  functioning -- reasoning is genuinely grounded in image-specific
+  detail, not generic/hallucinated boilerplate. Spot-checked example
+  (qid=1, VQA-RAD, "Are regions of the brain infarcted?"): Qwen's
+  response correctly identified "an axial MRI brain scan, likely a
+  diffusion-weighted imaging (DWI) sequence" and described
+  "hyperintense areas... in the left hemisphere" -- specific,
+  plausible radiological detail rather than a generic answer.
+
+- The "## Step {number}: " markdown convention (matching the text
+  pipeline's OPEN_SYSTEM_PROMPT style, applied to both MC and QA
+  prompts per later discussion) is followed consistently by Qwen;
+  Huatuo follows it less consistently (sometimes skips structure
+  entirely for simple questions -- see issue 2 above).
+
+- prm_processed_solution / orm_processed_solution text reformatting
+  (stripping "## " markdown, collapsing newlines, appending the "ки"
+  boundary token) works as designed and exactly matches the text
+  pipeline's own convention, including one inherited quirk: a
+  question's final-answer line (e.g. "## Final Answer: Yes") merges
+  into the same "ки"-tagged block as the preceding step, since
+  STEP_PATTERN only splits on "## Step N:" boundaries. Confirmed this
+  is not a regression -- python/3_test_dataset_sampling.py's
+  OPEN_SYSTEM_PROMPT/"## Final Diagnosis:" does the identical thing.
+
+- Auto-scoring logic behaves as designed for all three answer types:
+    MC:     exact letter match (pred == gt)
+    CLOSED: normalized (lowercased, whitespace-collapsed) exact text
+            match
+    OPEN:   always left unscored ("score": "None"), per the plan to
+            add an LLM-judge step later
+  Walked through the exact mechanics for qid=1 (CLOSED, correct="Yes"):
+  extract_qa_answer found "Yes" after "## Final Answer:", both pred and
+  gt normalize to "yes", exact string equality -> score=1. Important
+  caveat surfaced during this walkthrough: this is pure string
+  matching, not semantic judgment -- any phrasing beyond exactly what
+  was asked for (e.g. "Yes, there is evidence of infarction" instead of
+  a bare "Yes") would fail to match even though it's the correct
+  answer. This is a known limitation of the CLOSED scoring approach,
+  not a bug, and mirrors the same trade-off the text pipeline accepts
+  for its own exact-match scoring.
+
+- Every question in both smoke tests produced its full repeat_count=4
+  solutions without needing to lean heavily on the two-pass
+  retry-for-shortfall logic (mirrors
+  python/3_test_dataset_sampling.py's generate_all design: first pass
+  requests ceil(repeat_count*1.25) samples, retries only for questions
+  still short after filtering).
+
+- Multi-image questions (limit_mm_per_prompt={"image": 4}) and the
+  offline/CUDA-module environment fixes are all working correctly in
+  the SLURM context now -- no environment-level failures in smoke test
+  2, 3, or 4.
+
+- extract_mc_answer()'s parenthesized-letter fallback (added after
+  smoke test 2) is confirmed working in smoke test 3 -- recovers the
+  model's actual letter choice regardless of exact phrasing, and
+  correctly distinguishes a genuinely-wrong answer (qid=9283, extracted
+  'E' vs ground truth 'B') from an extraction failure, rather than just
+  defaulting everything to a pass.
+
+
+LIVE MEMORY MEASUREMENTS (during smoke test 3, via sstat/srun+nvidia-smi)
+-----------------------------------------------------------------------------
+Checked live GPU + host memory mid-run using `srun --jobid=<id> --overlap
+nvidia-smi` / `ps`, since `sacct` only reports peak-RSS after a job ends.
+
+                          Qwen3-VL-8B         HuatuoGPT-Vision-7B
+GPU used (of 40GB A100)   ~18.3 GB            ~19.7-20.1 GB
+Host RSS (EngineCore+py)  ~3.5 GB             ~3.3 GB
+
+Notable finding: Huatuo's GPU usage was NOT meaningfully lower than
+Qwen's despite having smaller model weights (15.67 GiB vs 16.79 GiB).
+Reason: `gpu_memory_utilization=0.90` makes vllm reserve memory up to
+90% of the card (~36.9GB on this 40GB A100) for EITHER model, using
+whatever headroom is left after loading weights to size the KV-cache
+pool bigger. So a smaller model doesn't use less total GPU memory --
+it gets a bigger KV-cache allocation instead (this is what drove
+Huatuo's ~4.5x faster generation throughput noted after smoke test 1,
+not a smaller memory footprint). Conclusion for full-run GPU sizing:
+one A100 is correctly sized for either model with headroom to spare;
+no OOM risk, no need for gpu_memory_utilization changes or a 2nd GPU
+for memory reasons.
+
+
+HOST-MEMORY SCALING ISSUE FOUND (discovered while sizing --mem for the
+full run, before running smoke test 4)
+---------------------------------------------------------------------------
+The smoke test's low host-RAM usage (~3.3-4.2GB) does NOT extrapolate
+safely to the full run. Root cause: `collect_prompts()` (called from
+`generate_all()`) builds the ENTIRE batch of conversations -- decoding
+every question's image(s) via PIL -- for the WHOLE input list in one
+pass, before making a single `llm.chat()` call. At smoke-test scale
+(12 questions, ~15-20 images) this is trivial. At full scale (11,286
+questions, ~12,139 image references per the 1_normalize_data.py
+completeness check) it is not.
+
+Measured actual image sizes from a random sample of 62 images across
+the dataset:
+  avg on-disk (compressed JPEG) size:        ~0.13 MB
+  avg decoded (raw RGB array) size:          ~1.53 MB  (~12x larger)
+  projected total if ALL ~12,139 images were loaded into memory at once:
+      ~18.6 GB
+
+This meant the originally-recommended --mem=16G (based on smoke-test
+timing/memory data alone) would NOT have been safe for a full,
+unchunked run -- and neither would a naive bump to --mem=8G. Would have
+needed --mem=24-32G+ for a single unsplit run, purely to hold decoded
+image data, on top of vllm's own ~3-4GB overhead.
+
+FIX: chunk processing by data_source instead of increasing --mem
+arbitrarily (see SMOKE TEST 4 below) -- more robust than just sizing
+--mem for the worst case, and adds a resumability benefit as well.
+
+
+SMOKE TEST 4 -- VALIDATING PER-DATA_SOURCE CHUNKING
+========================================================
+
+Changed python_mm/3_generate_traces.py's main() to process one
+data_source at a time instead of the whole input in one batch. The
+original single-batch code was commented out (not deleted) directly
+above the replacement, for reference:
+  - model (`llm = LLM(...)`) still loads exactly once per script
+    invocation -- only the per-question conversation-building/image-
+    decoding/generation step is chunked, since reloading the ~16GB
+    model per chunk would be wasteful (30-90s load+compile time each).
+  - raw questions are grouped into a `by_source` dict keyed by
+    data_source, then generate_all() is called once per group.
+  - each data_source now gets its OWN output file:
+    `{base}_{data_source}_{model_name}_{repeat_count}.json` instead of
+    one combined `{base}_{model_name}_{repeat_count}.json` file.
+  - `del transformed, dataset; gc.collect()` after each chunk to
+    actually release that source's decoded images before starting the
+    next one.
+
+This bounds peak image memory to whichever single source has the most
+images (SLAKE, ~7,033 questions) rather than all three sources combined
+-- roughly ~10-11GB instead of ~18.6GB. Doesn't need `--mem` raised
+above the existing 16G. Side benefit: a full run that dies partway
+through one data_source no longer loses the other, already-completed
+sources' output.
+
+Job 19658232 -- COMPLETED (11m53s), no new environment failures.
+Verified:
+  - 6 output files produced (3 data sources x 2 models), each correctly
+    named and containing only its own data_source's questions.
+  - Total 12 questions across the 3 per-model files, matching the
+    smoke test's --limit_per_source=4 x 3 sources exactly -- no
+    dropped or duplicated questions across the chunking boundary.
+  - Every question still produced its full repeat_count=4 solutions.
+  - Peak RSS (sacct) ~4.1GB -- expected to look unchanged from earlier
+    smoke tests, since 12 questions never stressed memory in the first
+    place; the chunking benefit is a full-scale-only concern and isn't
+    something the smoke test's scale can demonstrate directly.
+
+
+CURRENT DATASET SCOPE (for reference)
+-----------------------------------------
+11,286 total questions across 3 sources:
+  MC:     2,005  (medxpertqa_mm only)
+  CLOSED: 4,080  (vqa_rad + slake)
+  OPEN:   5,201  (vqa_rad + slake) -- unscored until the LLM-judge step
+                  exists; ~46% of the full dataset.
+
+
+NEXT STEPS
+--------------
+1. [DONE] Implement the extract_mc_answer() fallback -- fixed, confirmed
+   in smoke test 3.
+2. [DONE] Chunk processing by data_source to bound host memory at full
+   scale -- fixed, confirmed in smoke test 4.
+3. Decide repeat_count/scope for the full-scale run (still open --
+   text pipeline's default of 64 samples/question would mean ~1.4M
+   generations across both models at full dataset scale).
+4. Build the OPEN-answer LLM-judge labeling step. Confirmed the text
+   pipeline's existing judge script (python/1_train_dataset_RAG_judge_labeling.py)
+   is hardcoded to Google's Gemini API (google.generativeai, requires
+   --api_key) -- this is a design choice, not a requirement; any
+   capable LLM could substitute. Also relevant: Gemini's API call needs
+   internet access, which compute nodes on this cluster don't have (see
+   job 19657337 above) -- so this step would need to run from a login
+   node, or use a local model instead to avoid the network constraint
+   entirely.

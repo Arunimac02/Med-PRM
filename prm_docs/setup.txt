@@ -1,0 +1,569 @@
+MULTIMODAL MEDICAL PRM - SETUP PROGRESS NOTES
+===============================================
+
+GOAL
+----
+Build a multimodal medical Process Reward Model (PRM), extending the
+existing text-only Med-PRM codebase. Plan:
+  1. Use VQA benchmarks: VQA-RAD, SLAKE, MedXpertQA-image (no text-only
+     QA benchmarks needed for this).
+  2. Generate chain-of-thought reasoning traces using Qwen3-VL-8B-Instruct
+     plus one strong ~7B medical VLM (chose HuatuoGPT-Vision-7B-Qwen2.5VL).
+  3. Collect both correct and incorrect traces in a uniform format
+     (question, image, step-by-step reasoning, final answer, correctness
+     label), and review the incorrect ones.
+
+DONE SO FAR
+-----------
+
+1) Dataset download and preparation
+   Script: python_mm/0_preparing.py
+   Downloads and locally prepares all 3 benchmarks into dataset_mm/
+   (a new top-level folder, kept separate from the existing dataset/ dir
+   used by the text pipeline).
+
+   - VQA-RAD: downloaded from the official OSF release (JSON + image
+     folder), NOT the simplified HuggingFace mirror, because the official
+     release has richer metadata. Reconciled against the HF mirror's
+     train/test split using normalized question+answer text plus an
+     image pixel hash, to recover the standard split.
+     Result: train=1796, test=451, unmatched=1 (total 2248, matches the
+     original OSF pool exactly).
+
+   - SLAKE: downloaded from the original BoKelvin/SLAKE repo (bilingual,
+     more columns than the plain HF mirror). Filtered to English-language
+     questions only.
+     Result: train=4919, validation=1053, test=1061.
+
+   - MedXpertQA-MM: downloaded via snapshot_download, reading the raw
+     JSONL files directly (MM/dev.jsonl, MM/test.jsonl) instead of
+     load_dataset, because the Hub metadata used a newer "List" feature
+     type that the pinned datasets==3.6.0 in the PRM env can't parse.
+     Result: dev=5, test=2000.
+
+   All images were verified to decode correctly (checked via image
+   dimensions + numpy array conversion, not PIL's .verify(), since
+   .verify() gives false positives on images the `datasets` library has
+   already .load()-ed).
+
+2) Normalization into a common schema
+   Script: python_mm/1_normalize_data.py
+   Reads all 3 downloaded datasets and writes one unified JSON manifest:
+       dataset_mm/normalized/mm_benchmark.json
+
+   Common schema per row:
+     - question_id     : unique global integer, 1..N across all sources
+     - data_source      : "vqa_rad" | "slake" | "medxpertqa_mm"
+     - split             : original split name (train/validation/dev/test/unmatched)
+     - question          : question text
+     - options           : {"A": "...", ...} for MedXpertQA (MC), {} otherwise
+     - correct_answer    : answer text, or correct letter for MedXpertQA
+     - answer_type       : "MC" | "CLOSED" | "OPEN"
+     - images            : list of image file paths (always a list)
+     - modality          : imaging modality if the source states it directly, else None
+     - source_metadata   : remaining original fields, kept for traceability
+
+   Images are referenced by path (not copied/re-encoded) -- the manifest
+   points at the real image files already extracted under dataset_mm/.
+   This means the manifest is NOT self-contained: deleting the raw
+   per-dataset folders (vqa_rad/imgs, slake/imgs/imgs,
+   medxpertqa_mm/images/images) would break the image paths.
+
+   Result: 11,286 total rows (VQA-RAD 2248, SLAKE 7033, MedXpertQA-MM
+   2005). 0 missing image files out of 12,139 total image references.
+   question_id confirmed unique and sequential 1..11286.
+
+3) Model-inference environment
+   Created a new, separate conda environment, PRM_mm, so the existing
+   shared PRM environment (used for the text pipeline: training, RAG,
+   Gemini-judge labeling) is left untouched.
+
+   Reason for a new env: the two target vision-language models need
+   newer library versions than what's pinned in the PRM env:
+     - Qwen3-VL-8B-Instruct needs transformers>=4.57.0 and vllm>=0.11.0
+     - HuatuoGPT-Vision-7B-Qwen2.5VL needs transformers>=4.49.0 and vllm>0.7.2
+   The PRM env is pinned to transformers==4.46.3 and vllm==0.8.4, which
+   is too old for Qwen3-VL support.
+
+   Installed vllm (unpinned, let pip's resolver choose a mutually
+   compatible transformers+vllm pair) plus qwen-vl-utils and accelerate.
+
+   Verified BEFORE downloading full model weights (using lightweight,
+   config-only downloads):
+     - transformers can import both Qwen3VLForConditionalGeneration and
+       Qwen2_5_VLForConditionalGeneration
+     - vllm's ModelRegistry recognizes both architectures
+
+   Only the training-specific packages from the old PRM env (peft,
+   bitsandbytes, deepspeed, wandb, trl, pymilvus, google-generativeai)
+   were intentionally left out of PRM_mm, since this new env is for
+   inference only. These can be added later if/when a multimodal PRM
+   training step is needed.
+
+4) Model weights downloaded
+   Resolved the open question from the previous version of this doc:
+   checked home-directory quota (10GB, essentially full already from
+   other cached tools) vs scratch (897GB free), and confirmed
+   ~/.cache/huggingface is already symlinked to
+   /scratch/user/arunimac02/.cache/huggingface on this system -- so the
+   default HF cache (option "a" from the old next-steps list) was fine
+   as-is, no custom HF_HOME needed. Pre-downloaded via
+   huggingface_hub.snapshot_download (python_mm/2_download_models.py)
+   anyway, to verify completeness before any GPU job depended on it.
+
+   - Qwen/Qwen3-VL-8B-Instruct              -> 17GB, snapshot 0c351dd...
+   - FreedomIntelligence/HuatuoGPT-Vision-7B-Qwen2.5VL -> 16GB, snapshot 451ac32...
+
+   Both confirmed fully downloaded (no .incomplete blob files left).
+
+5) Multimodal trace-generation script written
+   Script: python_mm/3_generate_traces.py (multimodal equivalent of
+   python/3_test_dataset_sampling.py). Not yet validated against real
+   model output -- see smoke test status below.
+
+   Design decisions:
+   - Local images are attached to vllm's LLM.chat() using the
+     "image_pil" content-part shorthand (pass a PIL.Image object
+     directly in the message content list), not base64 data URIs.
+     Confirmed by inspecting vllm.entrypoints.chat_utils
+     .CustomChatCompletionContentPILImageParam in the actual installed
+     vllm (0.28.0) before writing this -- it wasn't documented anywhere
+     obvious.
+   - MC questions (medxpertqa_mm only) already have their answer choices
+     embedded in the question text by 1_normalize_data.py, so the MC
+     prompt doesn't re-format an options list.
+   - Both the MC prompt and the CLOSED/OPEN prompt use the same
+     '## Step {number}: ' markdown step-marker convention (with the
+     leading '## '), matching python/3_test_dataset_sampling.py's
+     OPEN_SYSTEM_PROMPT convention exactly, since prm_process_solution's
+     "ки"-tagging depends on recognizing that marker. STEP_PATTERN is
+     `r"(?:## )?Step \d+:"` so it still tolerates text without the '## '
+     prefix too.
+   - CLOSED/OPEN final-answer phrase is '## Final Answer: {answer}'
+     (not the text pipeline's '## Final Diagnosis: {Disease name}',
+     since VQA-RAD/SLAKE closed/open answers are often not diagnoses --
+     e.g. "yes", "MRI", "right kidney"). Prompt explicitly keeps the
+     original "must output a concise and clearly defined diagnostic
+     term" instruction, and adds "...or simply 'Yes' or 'No' if the
+     question is a yes/no question" plus two examples covering both
+     styles.
+   - prm_processed_solution / orm_processed_solution: these are NOT
+     produced by running an actual PRM or ORM model. They're pure text
+     reformatting of the raw "solution" field (strip markdown/newlines,
+     append the literal token " ки" per-step or once for the whole
+     solution) -- preparing the two candidate input shapes that a later,
+     not-yet-written multimodal training script will consume, exactly
+     mirroring how python/2_training.py / 2_training_lora.py consume
+     these same two fields today (replacing "ки" with "+"/"-" based on
+     the score label). The raw "solution" field is kept in the output
+     specifically so it can still be read by a human (for the "review
+     the incorrect ones" step) and by the future OPEN-answer LLM-judge
+     step, without needing to regenerate anything.
+   - Scoring: MC = exact letter match; CLOSED = normalized
+     (whitespace-collapsed, lowercased) exact text match; OPEN =
+     unscored ("score": "None"), same convention as the text pipeline's
+     OPEN_SOURCES.
+
+6) Smoke-test infra + environment debugging (in progress)
+   Before committing to a full 11,286-question x 2-model run, agreed to
+   validate the whole path end-to-end on a small slice: 4 questions per
+   data source (~12 total) x 4 samples x both models.
+
+   New files:
+   - scripts_mm/3_generate_traces_smoketest.sh -- shell wrapper, loops
+     over both models sequentially (not concurrently) on one GPU.
+   - slurm_jobs/run_generate_traces_mm_smoketest.sh -- SLURM submission,
+     1x A100, 16GB host RAM (not 64GB like run_scoring.sh -- that value
+     was sized for a much heavier 2x-A100 sharded full-dataset job and
+     wasn't re-derived for this smoke test; 16GB is plenty since the
+     ~8B model itself lives in GPU VRAM, not host RAM).
+
+   Hit three environment issues running this on the actual cluster
+   (compute node g084, gpu partition), all specific to PRM_mm's newer,
+   unpinned vllm (0.28.0) vs. the text pipeline's pinned vllm==0.8.4 --
+   none of these showed up in the original text-only pipeline:
+     a) `LLM(..., device="cuda")` -- TypeError, `device` was removed
+        from vllm's EngineArgs entirely in this version. Fixed by
+        dropping the kwarg (GPU selection is handled separately via
+        CUDA_VISIBLE_DEVICES).
+     b) Compute nodes on this cluster have no internet access (only
+        login nodes do). vllm/huggingface_hub tried to reach the Hub
+        anyway (to check for updated config files) and failed with
+        "Network is unreachable". Fixed by exporting HF_HUB_OFFLINE=1
+        and TRANSFORMERS_OFFLINE=1 in the SLURM script, forcing use of
+        the already-downloaded local cache.
+     c) vllm 0.28's V1 engine defaults to an optional FlashInfer-
+        accelerated sampler (VLLM_USE_FLASHINFER_SAMPLER=True by
+        default in vllm/envs.py) which JIT-compiles a CUDA kernel on
+        first use via nvcc -- not available by default in the PRM_mm
+        conda env or on the compute node's PATH. Fixed by adding
+        `module load CUDA/13.1.0` in the SLURM script (matches PRM_mm's
+        installed torch, which is built for CUDA 13.0) so nvcc is
+        available, rather than disabling FlashInfer.
+
+   Status as of this writing: job 19657724 submitted with all three
+   fixes applied, result not yet known.
+
+NEXT STEPS (NOT YET DONE)
+--------------------------
+
+1. Confirm smoke-test job 19657724 succeeds and produces the expected
+   two output JSON files (one per model) under
+   dataset_mm/smoketest_traces/, then spot-check a few generated
+   solutions by hand (readable step-by-step reasoning that actually
+   references the image, correct extraction of answer/score fields).
+
+2. Decide sample count (repeat_count) and scope for the full-scale run
+   -- deliberately deferred; the text pipeline's default (64 samples/
+   question) would mean ~1.4M generations across both models and the
+   full 11,286-question dataset, which is likely too expensive.
+
+3. Run the full-scale generation once (2) is decided, across all three
+   data sources and both models.
+
+4. Build a correctness-labeling step for OPEN-ended answers, using an
+   LLM-as-judge, mirroring the original text pipeline's approach
+   (Gemini-2.0-flash with a strict "output 1 or 0" prompt). Then filter
+   and collect the incorrect traces.
+
+5. Later: if/when training a multimodal PRM is needed, add the relevant
+   training packages (peft, bitsandbytes, deepspeed, wandb, trl) into
+   the environment, verifying version compatibility the same way as was
+   done for the inference packages.
+
+7) Smoke-test validation (4 rounds) -- full detail in
+   prm_docs/smoketest_analysis.txt
+   -----------------------------------------------------------------
+   Before the full run, ran 4 progressively-fixed smoke tests (~12
+   questions, both models) to validate the whole pipeline. Summary only
+   here -- see smoketest_analysis.txt for exact numbers/timestamps/logs:
+   - Smoke test 1: 3 failed SLURM submissions first (vllm's `device`
+     kwarg removed in 0.28.0; compute nodes have no internet, needed
+     HF_HUB_OFFLINE=1/TRANSFORMERS_OFFLINE=1; vllm's FlashInfer sampler
+     needs nvcc via `module load CUDA/13.1.0`), then succeeded.
+   - Found + fixed: Qwen truncating on long medxpertqa_mm vignettes
+     (max_tokens 2048->4096); Huatuo skipping the requested step-by-step
+     format entirely for simple answers (added a terse-answer fallback
+     to extract_qa_answer); Huatuo not using the exact "answer is"
+     phrase for MC answers (added a parenthesized-letter fallback to
+     extract_mc_answer).
+   - Discovered (while sizing --mem for the full run, not from a smoke
+     test directly): collect_prompts() decoded every image in the whole
+     input at once before generation started -- fine at smoke-test
+     scale, but ~18.6GB projected for the full dataset. Fixed by
+     chunking main() to process one data_source at a time (validated in
+     smoke test 4), later extended to fixed-size batches within each
+     data_source (see part 8 below).
+   - Smoke tests archived under logs_mm/inference/smoketest_{1,2,3,4}/
+     and dataset_mm/smoketest_traces/smoketest_{1,2,3,4}/.
+
+8) Full-scale run: planning, infrastructure, and current status
+   -----------------------------------------------------------------
+   a) repeat_count=64, matching the text pipeline's own default
+      (scripts/3_test_dataset_sampling.sh) exactly, per the paper --
+      11,286 questions x 64 samples x 2 models.
+
+   b) --mem=24G, derived from an EXACT measurement (not a sample), of
+      all ~12,139 real images in the dataset:
+        vqa_rad: 2,248 images -> 4.43 GB decoded
+        slake:   7,033 images -> 9.58 GB decoded  (largest single chunk)
+        medxpertqa_mm: 2,858 images -> 5.61 GB decoded
+      Largest per-data_source chunk (SLAKE) = 9.58GB + ~3.5GB vllm
+      engine overhead (measured live via `srun --overlap nvidia-smi`/
+      `ps` during a smoke test) -> ~13-14GB realistic peak, 24G leaves
+      ~10GB margin. (An earlier smoke-test-scale reading of ~4.2GB peak
+      RSS and a 30-image-per-source *sample* estimate of ~11GB for
+      SLAKE were both superseded by this exact full-dataset count --
+      worth remembering that small-sample estimates aren't reliable
+      enough for a multi-day job's memory sizing.)
+
+   c) Per-data_source chunking (smoke test 4) extended to fixed-size
+      BATCHING: added --batch_size (default 250 questions) to
+      python_mm/3_generate_traces.py. Each batch gets its own output
+      file (`{base}_{data_source}_{model_name}_{repeat_count}_batch{N}.json`)
+      under dataset_mm/generated_traces/, and any batch whose output
+      file already exists on disk is skipped. This means a
+      crashed/killed job is resumed just by resubmitting the same
+      `sbatch` command -- no separate resume flag or state file needed.
+      Full run produces 47 files/model (9 vqa_rad + 29 slake + 9
+      medxpertqa_mm batches) x 2 models = 94 files total.
+
+   d) Split into 2 separate SLURM jobs, one per model, each on its own
+      GPU (only 2 GPUs available -- confirmed further splitting by
+      data_source would NOT help evenly, since SLAKE alone is 62% of
+      the dataset and would still dominate wall-clock time regardless
+      of how many smaller GPUs the other two sources got):
+        slurm_jobs/run_generate_traces_mm_full_qwen.sh   -> scripts_mm/3_generate_traces_full_qwen.sh
+        slurm_jobs/run_generate_traces_mm_full_huatuo.sh -> scripts_mm/3_generate_traces_full_huatuo.sh
+      --time=96:00:00 -- confirmed via `sinfo -p gpu` this is the GPU
+      partition's HARD MAXIMUM (not just "long enough"), zero margin
+      past it. Acceptable specifically because of the batching/resume
+      design in (c) -- a kill right at the 96h wall just needs a
+      resubmit, not a lost run.
+      (The earlier combined-model files, scripts_mm/3_generate_traces_full.sh
+      and slurm_jobs/run_generate_traces_mm_full.sh, are superseded by
+      this per-model split but were left in place, not deleted.)
+
+   e) Submitted both jobs (19658748 Qwen, 19658750 Huatuo).
+
+      QWEN (19658748): running successfully. Real measured throughput
+      from the first 3 completed VQA-RAD batches: ~6.25 sec/question
+      (6.54, 6.15, 6.07 across batches 0-2), consistent run to run.
+      Extrapolated to the full 11,286 questions: ~19.9 hours total --
+      dramatically less than an earlier smoke-test-based extrapolation
+      of ~96 hours. That earlier estimate was methodologically wrong: it
+      took a small-batch (20 concurrent generations) latency-per-request
+      number and multiplied by total request count, without accounting
+      for vllm's continuous batching -- at full scale (250 questions x
+      ~80 samples/question submitted per batch) vllm runs far more
+      requests concurrently, so per-request latency from a tiny batch
+      badly overestimates total time. Lesson: measure throughput at a
+      batch size representative of real load, don't extrapolate from a
+      tiny one.
+
+      HUATUO (19658750): FAILED after 33m49s with
+      `vllm.exceptions.VLLMValidationError: The decoder prompt (length
+      4210) is longer than the maximum model length of 4096.`
+      Root cause: `max_model_len=args.max_tokens` in the LLM(...) call
+      -- this wrongly conflated the TOTAL context window (prompt text +
+      image vision-tokens + generation) with `max_tokens`, which is
+      meant to be only the generation budget. A real VQA-RAD prompt
+      (question text + 1 image) tokenized to 4,210 tokens under
+      Huatuo's own processor, before generation even started -- already
+      over the 4096 cap. Smoke tests never caught this because their
+      prompts were short enough to stay under it by coincidence.
+      Why Huatuo hit this and Qwen (so far) hadn't: each model has its
+      own vision encoder that converts the SAME image into a different
+      number of tokens (patch size / resolution-handling differences).
+      HuatuoGPT-Vision-7B-Qwen2.5VL is built on the Qwen2.5-VL
+      architecture (dynamic-resolution vision encoder, tends toward
+      more image tokens per image); Qwen3-VL-8B-Instruct's newer vision
+      encoder produced fewer tokens for the same images in what's been
+      processed so far. This is very likely a "when, not if" issue for
+      Qwen too, given the same design flaw applies to both models and
+      the dataset includes multi-image questions (up to 4 images) and
+      long medxpertqa_mm vignettes not yet reached by Qwen's job.
+      Decision: leave Qwen running / keep monitoring rather than cancel
+      it pre-emptively, since it's making real progress. Checked both
+      models' actual native max context length before deciding on a fix
+      approach: Qwen3-VL supports 262,144 tokens, Huatuo/Qwen2.5-VL
+      supports 128,000 -- so the model architectures are not the
+      constraint at all, only the mistaken config value was.
+      Rejected an unmeasured "just pad it a lot" fix (max_model_len=16384,
+      picked with no real basis beyond "4x the one observed failure").
+      Instead, writing python_mm/measure_prompt_lengths.py to find the
+      TRUE maximum prompt length (real text + real image tokenization,
+      via each model's own AutoProcessor, CPU-only, no vllm/GPU needed)
+      across all 11,286 questions for both models, so max_model_len can
+      be set to an exact, justified value (true max + max_tokens)
+      instead of a guess.
+
+      Measurement result (uncapped): Qwen max=9,157 tokens (question_id=
+      10848, 1 image), Huatuo max=11,950 tokens (SAME question_id=10848
+      -- Huatuo needs ~30% more tokens than Qwen for the identical
+      image+text, confirming the two models' vision encoders tokenize
+      images differently: Huatuo/Qwen2.5-VL's dynamic-resolution scheme
+      tends to produce more tokens per image than Qwen3-VL's for the
+      same picture). p50/p95/p99 (Qwen): 402/1586/2910. p50/p95/p99
+      (Huatuo): 470/2014/3755.
+
+   f) Considered just setting max_model_len to (measured max + max_tokens)
+      per model (13,253 for Qwen, 16,046 for Huatuo) and stopping there,
+      but chose instead to also fix the root cause -- a single
+      unusually-high-resolution image being allowed to blow up into
+      thousands of tokens -- via vllm's `mm_processor_kwargs={"max_pixels":
+      N}`, which caps how large an image is allowed to be scaled up
+      before it's tiled into vision-tokens, regardless of the source
+      file's real resolution. Rationale: fixing the cause bounds the
+      problem for every image in the dataset, not just the one specific
+      question found by a finite measurement; blindly enlarging
+      max_model_len only accommodates whatever the largest known case is
+      and could still be exceeded by an image not yet encountered.
+
+      Picked a shared ~1280-image-tokens-per-image budget (matches a
+      commonly-used Qwen-VL example default, not an arbitrary number),
+      converted to each model's own max_pixels via its patch/merge
+      geometry (Huatuo: 14px patch x 2x merge = 784 pixels/token, so
+      max_pixels=1280*784=1,003,520; Qwen3-VL: 16px patch x 2x merge =
+      1024 pixels/token, so max_pixels=1280*1024=1,310,720).
+
+      Re-ran measure_prompt_lengths.py with the cap applied (real
+      measurement again, not a formula estimate) to confirm it actually
+      works: new max for BOTH models dropped to 7,628 tokens (same value
+      for both -- expected, since the cap targets the same per-image
+      token budget for both). p95/p99 also dropped substantially (Qwen:
+      1393/1625; Huatuo: 1405/1820).
+
+   g) The new 7,628-token max came from a DIFFERENT question
+      (question_id=9569, medxpertqa_mm) than the original uncapped max
+      (10848) -- and checking it revealed a THIRD, separate bug: 9569
+      has 6 images, but the LLM(...) call sets
+      `limit_mm_per_prompt={"image": 4}`, meaning vllm would reject any
+      prompt with more than 4 images outright. Checked the real
+      distribution across the whole dataset (not assumed):
+        1 image: 10,866 questions   4 images: 22 questions
+        2 images:    237 questions   5 images: 78 questions
+        3 images:     59 questions   6 images: 24 questions
+      102 questions (all medxpertqa_mm) exceed the old 4-image limit --
+      a third distinct crash point both full runs would have eventually
+      hit, unrelated to the other two bugs. Fixed by raising the limit
+      to 6 (the real dataset maximum, not padded).
+
+   h) Combined all three fixes into python_mm/3_generate_traces.py:
+      - `--max_model_len` (new, required, decoupled from --max_tokens)
+      - `--max_pixels` (new, required, forwarded to vllm via
+        mm_processor_kwargs)
+      - `--max_images_per_prompt` (new, default 6, sets
+        limit_mm_per_prompt)
+      Values used: max_model_len=12,000 for both models (7,628 + 4,096
+      + a small buffer; both models share this since the capped max is
+      now identical for both), max_pixels=1,310,720 (Qwen) /
+      1,003,520 (Huatuo), max_images_per_prompt=6. Updated all three
+      shell scripts (scripts_mm/3_generate_traces_full_qwen.sh,
+      _full_huatuo.sh, _smoketest.sh) to pass these.
+
+   i) Ran a 5th smoke test (job 19672674) with all three fixes applied
+      together: COMPLETED cleanly, zero errors in either model's log,
+      all 6 expected output files produced (now with a `_batchN` suffix
+      from the earlier batching work), every question got its full 4
+      solutions. 2 residual empty-answer cases (both Huatuo, one in
+      SLAKE one in VQA-RAD) -- consistent with Huatuo's already-known
+      imperfect format adherence (see smoketest_analysis.txt), not a
+      new issue.
+
+   j) Cancelled Qwen's original job (19658748, confirmed CANCELLED via
+      sacct, 6h26m total runtime) rather than let it keep running toward
+      the certain future crash -- confirmed before cancelling that this
+      costs nothing beyond the one batch actually in-progress at cancel
+      time: 15 of 47 batches (all 9 vqa_rad + 6 of 29 slake, batches 0-5,
+      ~3,748 questions) were already complete and saved to disk (verified
+      by listing the actual output files, not just trusting the log --
+      see note on log buffering below), and the batch-skip-if-exists
+      resume logic means they will NOT be regenerated -- only whatever
+      wasn't finished yet continues. Confirmed the resume mechanism
+      directly in the code (python_mm/3_generate_traces.py:394-417)
+      rather than just asserting it: main() always loops through every
+      data_source and batch_idx from the very start on every invocation,
+      and does a plain `os.path.exists(out_path)` check per batch,
+      `continue`-ing (skip, near-instant, no GPU work) if that batch's
+      file already exists -- there is no separate saved resume-pointer
+      or state file, just this per-batch existence check re-run from
+      scratch every time.
+      One accepted trade-off: those 15 already-completed batches were
+      generated WITHOUT the max_pixels cap (it didn't exist yet when
+      Qwen started), so any unusually large image among those ~3,748
+      questions was processed at full original resolution rather than
+      the new capped resolution -- a minor inconsistency versus
+      everything generated after this fix, judged acceptable given how
+      rare oversized images are per the measurements above, versus
+      losing ~6 hours of real compute to regenerate them.
+      Confirmed the log file's "Done: batch N" print statements lag
+      behind the actual batch output files on disk (Python buffers
+      stdout when redirected to a file) -- the batch JSON files
+      themselves are the reliable source of truth for real progress,
+      not the log text.
+      Huatuo's job (19658750) had already failed at batch 0 (see part
+      e) and has zero completed batches, so it just starts fresh.
+
+      Resubmitted both jobs with all three fixes applied: Qwen =
+      job 19673587 (resumes at slake batch 6/28, skipping the 15
+      already-completed batches), Huatuo = job 19673588 (fresh start,
+      batch 0). Status as of this writing: both just submitted, result
+      not yet known.
+
+   k) Both full-scale jobs completed successfully, no errors, all 94
+      expected output files (47/model) present on disk.
+        Huatuo (19673588): COMPLETED, elapsed 9h49m41s
+          (2026-09-07T02:04:13 -> 11:53:54), exit 0:0.
+        Qwen   (19673587): COMPLETED, elapsed 20h51m25s
+          (2026-09-07T02:04:01 -> 22:55:26), exit 0:0.
+      Log for Huatuo reviewed line-by-line: only benign noise (Triton
+      cubin-cache warnings from a cold JIT cache, an irrelevant
+      Qwen2VL *video* pixel-cap deprecation notice -- this pipeline
+      only ever passes images, never video -- a harmless PIL palette-
+      transparency UserWarning, and a normal vllm engine-core teardown
+      message at the very end). Nothing indicating a real problem.
+
+      Outputs for both models reorganized from a flat directory into
+      per-model/per-data_source subfolders, to make the two models'
+      results easier to tell apart at a glance:
+        dataset_mm/generated_traces/HuatuoGPT-Vision-7B-Qwen2.5VL/{vqa_rad,slake,medxpertqa_mm}/
+        dataset_mm/generated_traces/Qwen3-VL-8B-Instruct/{vqa_rad,slake,medxpertqa_mm}/
+      (47 files each, counts verified after every move.)
+
+      Despite Huatuo needing ~30% more prompt/vision tokens per image
+      than Qwen (see part e above), Huatuo finished in under half
+      Qwen's wall-clock time. Measured per-question throughput (same
+      batches, excluding any pre-existing/resumed batches from the
+      timing) showed Huatuo ~2.5-3x faster across every data source
+      (e.g. vqa_rad: Huatuo 2.6s/q vs Qwen 6.3s/q; medxpertqa_mm:
+      Huatuo 7.1s/q vs Qwen 23.1s/q). Root cause, confirmed by
+      measuring actual generated-text length (not assumed): on the
+      same vqa_rad batch, Huatuo's solutions average 583 chars
+      (median 618, max 2,205) vs Qwen's 1,123 chars (median 1,088,
+      max 18,152). Qwen generates roughly 2x more text per response on
+      average, plus a much fatter tail of very long outputs. Since
+      vllm decode time scales with tokens actually generated (not
+      prompt length, which is parallelized during prefill), Qwen's
+      more verbose reasoning -- and occasional runaway generations --
+      cost far more wall-clock time per question than Huatuo's terser
+      responses, outweighing Huatuo's higher per-image token cost.
+
+      Investigated one specific Qwen failure mode found while
+      checking scoring completeness: in
+      mm_benchmark_medxpertqa_mm_Qwen3-VL-8B-Instruct_64_batch0.json,
+      all 16,000 solutions (250 q x 64 samples) have a `score` field
+      (none missing, none unscored -- this file is all-MC so "None"
+      scores don't apply), but 217/16,000 (~1.4%) have `answer: None`
+      -- the generated text got stuck in a repetition loop and never
+      reached a parseable final-answer line, running to the
+      max_tokens=4096 cap; these are auto-scored 0 (counted as
+      incorrect), not left unscored. Confirmed this is NOT a
+      regression: smoke test 5 used the identical temperature=0.7 /
+      top_p=0.9 / max_tokens=4096 config (no repetition_penalty set in
+      either case -- vllm default of 1.0, i.e. none), and its typical
+      output length matches the full run almost exactly (mean 1,066
+      vs 1,123 chars on vqa_rad) -- only the full run's much larger
+      sample count (16,000 vs 16 generations checked) was large enough
+      to surface this ~1-1.5% low-probability decoding tail; at 16
+      samples the odds of seeing zero such cases by chance are ~80%.
+      Not fixed (would need a `repetition_penalty` added to
+      SamplingParams in python_mm/3_generate_traces.py:336) -- left as
+      a known, quantified, low-rate artifact rather than re-running
+      the full generation.
+
+NEXT STEP SCOPE NOTE (OPEN-answer LLM judge, step 4 above)
+------------------------------------------------------------
+Before starting this, counted what it actually requires: OPEN-type
+questions only exist in vqa_rad (949) and slake (4,252) --
+medxpertqa_mm is 100% MC, already exact-match scored, needs no
+judging. 949 + 4,252 = 5,201 OPEN questions x 64 samples x 2 models =
+665,728 solutions would need an LLM-judge call under the "judge every
+solution" approach. Checked the existing text-pipeline Gemini code
+(python/1_train_dataset_RAG_judge_labeling.py) for a reusable
+pattern -- it's NOT a fit as-is: that script judges per-step reasoning
+quality for solutions whose final-answer correctness (orm_label) is
+already known, not "does this OPEN free-text answer match the correct
+answer" (a genuinely new judge, no existing analog in this repo).
+Explicitly NOT started -- deferred pending a decision on Gemini API
+key/quota and whether to judge all 665,728 solutions vs dedupe
+identical (question_id, extracted-answer-text) pairs first vs pilot on
+vqa_rad alone before committing to slake's larger share of the cost.
+
+ENVIRONMENT NOTES
+------------------
+- Conda envs live under /scratch/user/arunimac02/.conda/envs/ (not
+  /home/arunimac02/.conda/envs/) due to a scratch-redirect .condarc
+  configuration on this system.
+- Existing shared env: PRM (text pipeline: training, RAG, Gemini judge).
+- New env for multimodal inference: PRM_mm (kept separate, untouched
+  relative to PRM). Installed vllm==0.28.0 (unpinned) + torch built for
+  CUDA 13.0.
+- Conda base: /sw/eb/sw/Anaconda3/2024.02-1
+- Compute nodes (gpu partition, e.g. g084) have no internet access --
+  HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 required for any job that
+  touches huggingface_hub/transformers/vllm once models are already
+  cached locally.
+- nvcc is not on PATH by default in PRM_mm; `module load CUDA/13.1.0`
+  is needed alongside it for anything that JIT-compiles CUDA kernels
+  (e.g. vllm's FlashInfer sampler).
